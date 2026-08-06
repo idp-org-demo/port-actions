@@ -1,0 +1,1667 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Port Self-Service Action: Scaffold Java Spring Boot Service
+#
+# Triggered by Port's self-service engine.
+# Generates a full Java Spring Boot microservice with:
+#   • Maven project structure (pom.xml, multi-module ready)
+#   • Spring Boot 3.x application with health, OpenAPI, actuator
+#   • Multi-profile application config (dev / staging / prod)
+#   • Multi-stage Dockerfile (build + runtime, distroless final image)
+#   • Kubernetes manifests under k8s/base + overlays (dev / prod)
+#       - Namespace, ServiceAccount, ConfigMap, Secret template
+#       - Deployment (rolling update, liveness/readiness probes)
+#       - Service (ClusterIP), Ingress (nginx)
+#       - HorizontalPodAutoscaler, PodDisruptionBudget, NetworkPolicy
+#       - Kustomize base + overlays
+#   • GitHub Actions CI/CD pipeline (build → test → scan → push → deploy)
+#   • .gitignore, .dockerignore, README
+#
+# Secrets required in the repo / org:
+#   GH_TOKEN            – GitHub PAT (repo:write, workflow)
+#   PORT_CLIENT_ID      – Port API client id
+#   PORT_CLIENT_SECRET  – Port API client secret
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Scaffold Java Spring Boot Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      port_payload:
+        required: true
+        type: string
+        description: "Port action payload (injected automatically by Port)"
+
+env:
+  PORT_API: "https://api.getport.io/v1"
+
+jobs:
+  scaffold:
+    name: Generate & Push Scaffold
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # ── 0. Parse Port Payload ────────────────────────────────────────────────
+      - name: Extract inputs from Port payload
+        id: inputs
+        env:
+          RAW: ${{ github.event.inputs.port_payload }}
+        run: |
+          echo "Parsing Port payload..."
+          PROPS=$(echo "$RAW" | python3 -c "
+          import json, sys
+          p = json.load(sys.stdin)
+          props = p.get('payload', {}).get('properties', {})
+          ctx   = p.get('payload', {}).get('context', {})
+          run_id = p.get('context', {}).get('runId', '')
+          print('SERVICE_NAME='    + props.get('service_name', 'my-service'))
+          print('DESCRIPTION='     + props.get('description', 'A Spring Boot microservice'))
+          print('GROUP_ID='        + props.get('group_id', 'com.example'))
+          print('JAVA_VERSION='    + str(props.get('java_version', '21')))
+          print('SB_VERSION='      + props.get('spring_boot_version', '3.3.2'))
+          print('PORT_NUM='        + str(props.get('port_number', '8080')))
+          print('K8S_NAMESPACE='   + props.get('k8s_namespace', 'default'))
+          print('REPLICAS='        + str(props.get('replicas', '2')))
+          print('CPU_REQUEST='     + props.get('cpu_request', '250m'))
+          print('CPU_LIMIT='       + props.get('cpu_limit', '1000m'))
+          print('MEM_REQUEST='     + props.get('memory_request', '256Mi'))
+          print('MEM_LIMIT='       + props.get('memory_limit', '512Mi'))
+          print('GITHUB_ORG='      + props.get('github_org', 'idp-org-demo'))
+          print('TEAM='            + props.get('team', 'platform'))
+          print('PORT_RUN_ID='     + run_id)
+          ")
+          echo "$PROPS" >> "$GITHUB_ENV"
+          echo "$PROPS"
+
+      # Derive computed values
+      - name: Derive computed values
+        run: |
+          ARTIFACT_ID="${SERVICE_NAME}"
+          PACKAGE_PATH=$(echo "${GROUP_ID}" | tr '.' '/')
+          PACKAGE_PATH="${PACKAGE_PATH}/${ARTIFACT_ID//-/}"
+          MAIN_CLASS=$(echo "${ARTIFACT_ID}" | sed -r 's/(^|-)([a-z])/\U\2/g')Application
+          REPO_NAME="${SERVICE_NAME}"
+
+          echo "ARTIFACT_ID=${ARTIFACT_ID}"             >> "$GITHUB_ENV"
+          echo "PACKAGE_PATH=${PACKAGE_PATH}"           >> "$GITHUB_ENV"
+          echo "JAVA_PACKAGE=${GROUP_ID}.${ARTIFACT_ID//-/}" >> "$GITHUB_ENV"
+          echo "MAIN_CLASS=${MAIN_CLASS}"               >> "$GITHUB_ENV"
+          echo "REPO_NAME=${REPO_NAME}"                 >> "$GITHUB_ENV"
+          echo "IMAGE_NAME=ghcr.io/${GITHUB_ORG}/${SERVICE_NAME}" >> "$GITHUB_ENV"
+
+      # ── 1. Notify Port: Action started ──────────────────────────────────────
+      - name: Get Port access token
+        id: port_token
+        run: |
+          TOKEN=$(curl -s -X POST "${PORT_API}/auth/access_token" \
+            -H "Content-Type: application/json" \
+            -d "{\"clientId\":\"${{ secrets.PORT_CLIENT_ID }}\",\"clientSecret\":\"${{ secrets.PORT_CLIENT_SECRET }}\"}" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['accessToken'])")
+          echo "PORT_TOKEN=${TOKEN}" >> "$GITHUB_ENV"
+
+      - name: Log start to Port
+        run: |
+          curl -s -X PATCH "${PORT_API}/actions/runs/${PORT_RUN_ID}" \
+            -H "Authorization: Bearer ${PORT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "status": "IN_PROGRESS",
+              "summary": "Scaffolding Java Spring Boot service...",
+              "link": "'"https://github.com/${GITHUB_ORG}/${REPO_NAME}"'"
+            }'
+
+      # ── 2. Create GitHub Repository ─────────────────────────────────────────
+      - name: Create GitHub repository
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          echo "Creating repository ${GITHUB_ORG}/${REPO_NAME}..."
+          gh repo create "${GITHUB_ORG}/${REPO_NAME}" \
+            --description "${DESCRIPTION}" \
+            --private \
+            --add-readme=false \
+            --gitignore="" \
+            || echo "Repository may already exist — proceeding."
+
+          # Brief pause for GitHub to finish provisioning
+          sleep 3
+
+      # ── 3. Check out the new empty repo ──────────────────────────────────────
+      - name: Checkout new repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITHUB_ORG }}/${{ env.REPO_NAME }}
+          token: ${{ secrets.GH_TOKEN }}
+          path: generated-service
+
+      # ── 4. Generate Project Structure ───────────────────────────────────────
+      - name: Generate project files
+        working-directory: generated-service
+        run: |
+          set -euo pipefail
+
+          # ── Directory skeleton ────────────────────────────────────────────────
+          SRC="src/main/java/${PACKAGE_PATH}"
+          TEST="src/test/java/${PACKAGE_PATH}"
+          RES="src/main/resources"
+          K8S="k8s"
+
+          mkdir -p \
+            "${SRC}/controller" \
+            "${SRC}/service" \
+            "${SRC}/model" \
+            "${SRC}/config" \
+            "${SRC}/exception" \
+            "${TEST}" \
+            "${RES}" \
+            "${K8S}/base" \
+            "${K8S}/overlays/dev" \
+            "${K8S}/overlays/staging" \
+            "${K8S}/overlays/prod" \
+            ".github/workflows" \
+            "scripts"
+
+          echo "✔ Directory structure created"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # pom.xml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > pom.xml << 'POMEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                                       https://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <parent>
+              <groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-starter-parent</artifactId>
+              <version>__SB_VERSION__</version>
+              <relativePath/>
+            </parent>
+
+            <groupId>__GROUP_ID__</groupId>
+            <artifactId>__ARTIFACT_ID__</artifactId>
+            <version>0.0.1-SNAPSHOT</version>
+            <packaging>jar</packaging>
+            <name>__SERVICE_NAME__</name>
+            <description>__DESCRIPTION__</description>
+
+            <properties>
+              <java.version>__JAVA_VERSION__</java.version>
+              <maven.compiler.source>__JAVA_VERSION__</maven.compiler.source>
+              <maven.compiler.target>__JAVA_VERSION__</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              <!-- Dependency versions -->
+              <springdoc.version>2.5.0</springdoc.version>
+              <mapstruct.version>1.5.5.Final</mapstruct.version>
+              <lombok.version>1.18.32</lombok.version>
+              <testcontainers.version>1.19.8</testcontainers.version>
+              <jacoco.version>0.8.12</jacoco.version>
+            </properties>
+
+            <dependencies>
+              <!-- Core Spring Boot -->
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-web</artifactId>
+              </dependency>
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-actuator</artifactId>
+              </dependency>
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-validation</artifactId>
+              </dependency>
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-data-jpa</artifactId>
+              </dependency>
+
+              <!-- Security -->
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-security</artifactId>
+              </dependency>
+
+              <!-- OpenAPI / Swagger -->
+              <dependency>
+                <groupId>org.springdoc</groupId>
+                <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+                <version>${springdoc.version}</version>
+              </dependency>
+
+              <!-- Observability -->
+              <dependency>
+                <groupId>io.micrometer</groupId>
+                <artifactId>micrometer-registry-prometheus</artifactId>
+              </dependency>
+              <dependency>
+                <groupId>io.micrometer</groupId>
+                <artifactId>micrometer-tracing-bridge-brave</artifactId>
+              </dependency>
+
+              <!-- Utilities -->
+              <dependency>
+                <groupId>org.projectlombok</groupId>
+                <artifactId>lombok</artifactId>
+                <version>${lombok.version}</version>
+                <optional>true</optional>
+              </dependency>
+              <dependency>
+                <groupId>org.mapstruct</groupId>
+                <artifactId>mapstruct</artifactId>
+                <version>${mapstruct.version}</version>
+              </dependency>
+
+              <!-- Dev tools -->
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-devtools</artifactId>
+                <scope>runtime</scope>
+                <optional>true</optional>
+              </dependency>
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-configuration-processor</artifactId>
+                <optional>true</optional>
+              </dependency>
+
+              <!-- Test -->
+              <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-starter-test</artifactId>
+                <scope>test</scope>
+              </dependency>
+              <dependency>
+                <groupId>org.springframework.security</groupId>
+                <artifactId>spring-security-test</artifactId>
+                <scope>test</scope>
+              </dependency>
+              <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>junit-jupiter</artifactId>
+                <version>${testcontainers.version}</version>
+                <scope>test</scope>
+              </dependency>
+            </dependencies>
+
+            <build>
+              <plugins>
+                <!-- Spring Boot Maven Plugin -->
+                <plugin>
+                  <groupId>org.springframework.boot</groupId>
+                  <artifactId>spring-boot-maven-plugin</artifactId>
+                  <configuration>
+                    <image>
+                      <name>${IMAGE_NAME}:${project.version}</name>
+                    </image>
+                    <excludes>
+                      <exclude>
+                        <groupId>org.projectlombok</groupId>
+                        <artifactId>lombok</artifactId>
+                      </exclude>
+                    </excludes>
+                  </configuration>
+                </plugin>
+
+                <!-- Compiler Plugin (Lombok + MapStruct) -->
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-compiler-plugin</artifactId>
+                  <configuration>
+                    <source>${java.version}</source>
+                    <target>${java.version}</target>
+                    <annotationProcessorPaths>
+                      <path>
+                        <groupId>org.projectlombok</groupId>
+                        <artifactId>lombok</artifactId>
+                        <version>${lombok.version}</version>
+                      </path>
+                      <path>
+                        <groupId>org.mapstruct</groupId>
+                        <artifactId>mapstruct-processor</artifactId>
+                        <version>${mapstruct.version}</version>
+                      </path>
+                    </annotationProcessorPaths>
+                  </configuration>
+                </plugin>
+
+                <!-- JaCoCo Code Coverage -->
+                <plugin>
+                  <groupId>org.jacoco</groupId>
+                  <artifactId>jacoco-maven-plugin</artifactId>
+                  <version>${jacoco.version}</version>
+                  <executions>
+                    <execution>
+                      <goals><goal>prepare-agent</goal></goals>
+                    </execution>
+                    <execution>
+                      <id>report</id>
+                      <phase>test</phase>
+                      <goals><goal>report</goal></goals>
+                    </execution>
+                    <execution>
+                      <id>check</id>
+                      <goals><goal>check</goal></goals>
+                      <configuration>
+                        <rules>
+                          <rule>
+                            <limits>
+                              <limit>
+                                <counter>LINE</counter>
+                                <value>COVEREDRATIO</value>
+                                <minimum>0.80</minimum>
+                              </limit>
+                            </limits>
+                          </rule>
+                        </rules>
+                      </configuration>
+                    </execution>
+                  </executions>
+                </plugin>
+
+                <!-- Surefire (unit tests) -->
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-surefire-plugin</artifactId>
+                  <configuration>
+                    <argLine>@{argLine} -Xmx512m</argLine>
+                  </configuration>
+                </plugin>
+
+                <!-- Failsafe (integration tests) -->
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-failsafe-plugin</artifactId>
+                  <executions>
+                    <execution>
+                      <goals>
+                        <goal>integration-test</goal>
+                        <goal>verify</goal>
+                      </goals>
+                    </execution>
+                  </executions>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          POMEOF
+
+          # Replace placeholders
+          sed -i "s|__SB_VERSION__|${SB_VERSION}|g" pom.xml
+          sed -i "s|__GROUP_ID__|${GROUP_ID}|g"     pom.xml
+          sed -i "s|__ARTIFACT_ID__|${ARTIFACT_ID}|g" pom.xml
+          sed -i "s|__SERVICE_NAME__|${SERVICE_NAME}|g" pom.xml
+          sed -i "s|__DESCRIPTION__|${DESCRIPTION}|g" pom.xml
+          sed -i "s|__JAVA_VERSION__|${JAVA_VERSION}|g" pom.xml
+          sed -i "s|\${IMAGE_NAME}|${IMAGE_NAME}|g" pom.xml
+
+          echo "✔ pom.xml generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # Spring Boot Main Application
+          # ─────────────────────────────────────────────────────────────────────
+          MAIN_APP_FILE="${SRC}/${MAIN_CLASS}.java"
+          cat > "${MAIN_APP_FILE}" << JAVAEOF
+          package ${JAVA_PACKAGE};
+
+          import org.springframework.boot.SpringApplication;
+          import org.springframework.boot.autoconfigure.SpringBootApplication;
+          import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
+
+          /**
+           * ${SERVICE_NAME} – Spring Boot Application Entry Point.
+           *
+           * <p>Generated by the Platform Engineering scaffolding pipeline.
+           * Modify this file as needed for your service's requirements.
+           */
+          @SpringBootApplication
+          @ConfigurationPropertiesScan
+          public class ${MAIN_CLASS} {
+
+              public static void main(String[] args) {
+                  SpringApplication.run(${MAIN_CLASS}.class, args);
+              }
+          }
+          JAVAEOF
+          echo "✔ Main application class generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # Health Controller
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${SRC}/controller/HealthController.java" << JAVAEOF
+          package ${JAVA_PACKAGE}.controller;
+
+          import io.swagger.v3.oas.annotations.Operation;
+          import io.swagger.v3.oas.annotations.tags.Tag;
+          import org.springframework.http.ResponseEntity;
+          import org.springframework.web.bind.annotation.GetMapping;
+          import org.springframework.web.bind.annotation.RequestMapping;
+          import org.springframework.web.bind.annotation.RestController;
+
+          import java.time.Instant;
+          import java.util.Map;
+
+          /**
+           * Lightweight liveness / readiness endpoint exposed at /api/v1/health.
+           * The Kubernetes probes are wired to /actuator/health (Spring Boot Actuator);
+           * this controller is an additional application-level health endpoint.
+           */
+          @RestController
+          @RequestMapping("/api/v1")
+          @Tag(name = "Health", description = "Service health and readiness endpoints")
+          public class HealthController {
+
+              @GetMapping("/health")
+              @Operation(summary = "Application health check", description = "Returns service status and timestamp")
+              public ResponseEntity<Map<String, Object>> health() {
+                  return ResponseEntity.ok(Map.of(
+                      "status",    "UP",
+                      "service",   "${SERVICE_NAME}",
+                      "timestamp", Instant.now().toString()
+                  ));
+              }
+          }
+          JAVAEOF
+          echo "✔ HealthController generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # Global Exception Handler
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${SRC}/exception/GlobalExceptionHandler.java" << JAVAEOF
+          package ${JAVA_PACKAGE}.exception;
+
+          import lombok.extern.slf4j.Slf4j;
+          import org.springframework.http.HttpStatus;
+          import org.springframework.http.ProblemDetail;
+          import org.springframework.web.bind.MethodArgumentNotValidException;
+          import org.springframework.web.bind.annotation.ExceptionHandler;
+          import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+          import java.net.URI;
+          import java.time.Instant;
+
+          /**
+           * Centralised RFC 7807 Problem Detail error handler.
+           */
+          @RestControllerAdvice
+          @Slf4j
+          public class GlobalExceptionHandler {
+
+              @ExceptionHandler(MethodArgumentNotValidException.class)
+              public ProblemDetail handleValidation(MethodArgumentNotValidException ex) {
+                  ProblemDetail pd = ProblemDetail.forStatus(HttpStatus.BAD_REQUEST);
+                  pd.setTitle("Validation Failed");
+                  pd.setType(URI.create("https://problems.${SERVICE_NAME}.example.com/validation-error"));
+                  pd.setProperty("timestamp", Instant.now());
+                  pd.setProperty("errors", ex.getBindingResult().getFieldErrors().stream()
+                      .map(e -> e.getField() + ": " + e.getDefaultMessage())
+                      .toList());
+                  return pd;
+              }
+
+              @ExceptionHandler(Exception.class)
+              public ProblemDetail handleGeneric(Exception ex) {
+                  log.error("Unhandled exception", ex);
+                  ProblemDetail pd = ProblemDetail.forStatus(HttpStatus.INTERNAL_SERVER_ERROR);
+                  pd.setTitle("Internal Server Error");
+                  pd.setType(URI.create("https://problems.${SERVICE_NAME}.example.com/internal-error"));
+                  pd.setProperty("timestamp", Instant.now());
+                  return pd;
+              }
+          }
+          JAVAEOF
+          echo "✔ GlobalExceptionHandler generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # OpenAPI Configuration
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${SRC}/config/OpenApiConfig.java" << JAVAEOF
+          package ${JAVA_PACKAGE}.config;
+
+          import io.swagger.v3.oas.models.Components;
+          import io.swagger.v3.oas.models.OpenAPI;
+          import io.swagger.v3.oas.models.info.Contact;
+          import io.swagger.v3.oas.models.info.Info;
+          import io.swagger.v3.oas.models.info.License;
+          import io.swagger.v3.oas.models.security.SecurityRequirement;
+          import io.swagger.v3.oas.models.security.SecurityScheme;
+          import org.springframework.context.annotation.Bean;
+          import org.springframework.context.annotation.Configuration;
+
+          @Configuration
+          public class OpenApiConfig {
+
+              @Bean
+              public OpenAPI openAPI() {
+                  final String securitySchemeName = "bearerAuth";
+                  return new OpenAPI()
+                      .info(new Info()
+                          .title("${SERVICE_NAME} API")
+                          .description("${DESCRIPTION}")
+                          .version("v1")
+                          .contact(new Contact()
+                              .name("${TEAM} Team")
+                              .email("${TEAM}@example.com"))
+                          .license(new License()
+                              .name("Internal Use Only")))
+                      .addSecurityItem(new SecurityRequirement().addList(securitySchemeName))
+                      .components(new Components()
+                          .addSecuritySchemes(securitySchemeName, new SecurityScheme()
+                              .name(securitySchemeName)
+                              .type(SecurityScheme.Type.HTTP)
+                              .scheme("bearer")
+                              .bearerFormat("JWT")));
+              }
+          }
+          JAVAEOF
+          echo "✔ OpenApiConfig generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # application.yml (base)
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${RES}/application.yml" << YAMLEOF
+          spring:
+            application:
+              name: ${SERVICE_NAME}
+            profiles:
+              active: \${SPRING_PROFILES_ACTIVE:dev}
+            jpa:
+              open-in-view: false
+              hibernate:
+                ddl-auto: validate
+            datasource:
+              url: \${DB_URL:jdbc:h2:mem:devdb;DB_CLOSE_DELAY=-1}
+              username: \${DB_USERNAME:sa}
+              password: \${DB_PASSWORD:}
+              driver-class-name: \${DB_DRIVER:org.h2.Driver}
+              hikari:
+                maximum-pool-size: 10
+                minimum-idle: 2
+                connection-timeout: 30000
+                idle-timeout: 600000
+                max-lifetime: 1800000
+
+          server:
+            port: ${PORT_NUM}
+            shutdown: graceful
+            compression:
+              enabled: true
+            error:
+              include-message: never
+              include-stacktrace: never
+
+          management:
+            endpoints:
+              web:
+                exposure:
+                  include: health,info,metrics,prometheus,readiness,liveness
+            endpoint:
+              health:
+                probes:
+                  enabled: true
+                show-details: when-authorized
+              metrics:
+                enabled: true
+            health:
+              livenessState:
+                enabled: true
+              readinessState:
+                enabled: true
+            metrics:
+              export:
+                prometheus:
+                  enabled: true
+              tags:
+                service: ${SERVICE_NAME}
+                team: ${TEAM}
+
+          springdoc:
+            api-docs:
+              path: /v3/api-docs
+            swagger-ui:
+              path: /swagger-ui.html
+              operationsSorter: method
+
+          logging:
+            pattern:
+              console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [%X{traceId:-},%X{spanId:-}] %logger{36} - %msg%n"
+            level:
+              root: INFO
+              ${JAVA_PACKAGE}: DEBUG
+          YAMLEOF
+          echo "✔ application.yml generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # application-prod.yml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${RES}/application-prod.yml" << YAMLEOF
+          spring:
+            jpa:
+              hibernate:
+                ddl-auto: none
+            datasource:
+              url: \${DB_URL}
+              username: \${DB_USERNAME}
+              password: \${DB_PASSWORD}
+              driver-class-name: org.postgresql.Driver
+
+          logging:
+            level:
+              root: WARN
+              ${JAVA_PACKAGE}: INFO
+
+          springdoc:
+            swagger-ui:
+              enabled: false   # Disable Swagger UI in production
+            api-docs:
+              enabled: false
+          YAMLEOF
+          echo "✔ application-prod.yml generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # Integration Test Stub
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${TEST}/${MAIN_CLASS}Tests.java" << JAVAEOF
+          package ${JAVA_PACKAGE};
+
+          import org.junit.jupiter.api.Test;
+          import org.springframework.boot.test.context.SpringBootTest;
+          import org.springframework.test.context.ActiveProfiles;
+
+          @SpringBootTest
+          @ActiveProfiles("test")
+          class ${MAIN_CLASS}Tests {
+
+              @Test
+              void contextLoads() {
+                  // Verifies the Spring context starts without errors
+              }
+          }
+          JAVAEOF
+          echo "✔ Application tests generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # Dockerfile (multi-stage, distroless runtime)
+          # ─────────────────────────────────────────────────────────────────────
+          cat > Dockerfile << DOCKEREOF
+          # ── Stage 1: Build ────────────────────────────────────────────────────
+          FROM eclipse-temurin:${JAVA_VERSION}-jdk-alpine AS build
+
+          WORKDIR /workspace
+
+          # Cache Maven dependencies separately from source code
+          COPY pom.xml .
+          RUN --mount=type=cache,target=/root/.m2 \
+              mvn -B dependency:go-offline -q
+
+          # Copy source and build
+          COPY src ./src
+          RUN --mount=type=cache,target=/root/.m2 \
+              mvn -B package -DskipTests -q
+
+          # Explode the fat jar for layered Docker image
+          RUN mkdir -p target/dependency && \
+              (cd target/dependency; jar -xf ../*.jar)
+
+          # ── Stage 2: Runtime (distroless) ─────────────────────────────────────
+          FROM gcr.io/distroless/java${JAVA_VERSION}-debian12:nonroot
+
+          # Labels (OCI standard)
+          LABEL org.opencontainers.image.title="${SERVICE_NAME}" \
+                org.opencontainers.image.description="${DESCRIPTION}" \
+                org.opencontainers.image.vendor="${TEAM}" \
+                org.opencontainers.image.source="https://github.com/${GITHUB_ORG}/${REPO_NAME}"
+
+          WORKDIR /app
+
+          # Copy exploded jar layers (best-practice ordering by change frequency)
+          COPY --from=build /workspace/target/dependency/BOOT-INF/lib     ./BOOT-INF/lib
+          COPY --from=build /workspace/target/dependency/META-INF          ./META-INF
+          COPY --from=build /workspace/target/dependency/BOOT-INF/classes  ./BOOT-INF/classes
+          COPY --from=build /workspace/target/dependency/org               ./org
+
+          EXPOSE ${PORT_NUM}
+
+          # JVM tuning for containers
+          ENV JAVA_OPTS="-XX:+UseContainerSupport \
+                         -XX:MaxRAMPercentage=75.0 \
+                         -XX:+UseG1GC \
+                         -Djava.security.egd=file:/dev/./urandom \
+                         -Dspring.profiles.active=prod"
+
+          ENTRYPOINT ["java", "-cp", "BOOT-INF/classes:BOOT-INF/lib/*", "org.springframework.boot.loader.launch.JarLauncher"]
+          DOCKEREOF
+          echo "✔ Dockerfile generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # .dockerignore
+          # ─────────────────────────────────────────────────────────────────────
+          cat > .dockerignore << 'EOF'
+          .git
+          .gitignore
+          target/
+          k8s/
+          .github/
+          *.md
+          .mvn/
+          mvnw
+          EOF
+          echo "✔ .dockerignore generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # .gitignore
+          # ─────────────────────────────────────────────────────────────────────
+          cat > .gitignore << 'EOF'
+          # Maven
+          target/
+          !.mvn/wrapper/maven-wrapper.jar
+          !**/src/main/**/target/
+          !**/src/test/**/target/
+
+          # IDE
+          .idea/
+          *.iws
+          *.iml
+          *.ipr
+          .vscode/
+          .classpath
+          .project
+          .settings/
+          .factorypath
+
+          # OS
+          .DS_Store
+          Thumbs.db
+
+          # Spring Boot
+          spring-shell.log
+          application-local.yml
+          application-local.properties
+
+          # Secrets / envs
+          .env
+          .env.*
+          *.key
+          *.pem
+          *.p12
+          *.jks
+          secrets/
+
+          # Logs
+          *.log
+          logs/
+          EOF
+          echo "✔ .gitignore generated"
+
+          # ═══════════════════════════════════════════════════════════════════
+          # KUBERNETES MANIFESTS
+          # ═══════════════════════════════════════════════════════════════════
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/base/namespace.yaml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/base/namespace.yaml" << YAMLEOF
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: ${K8S_NAMESPACE}
+            labels:
+              name: ${K8S_NAMESPACE}
+              managed-by: platform-engineering
+              team: ${TEAM}
+          YAMLEOF
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/base/serviceaccount.yaml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/base/serviceaccount.yaml" << YAMLEOF
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: ${SERVICE_NAME}
+            namespace: ${K8S_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: ${SERVICE_NAME}
+              app.kubernetes.io/managed-by: platform-engineering
+            annotations:
+              # Uncomment and configure for IRSA (AWS) or Workload Identity (GCP)
+              # eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT:role/ROLE"
+          automountServiceAccountToken: false
+          YAMLEOF
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/base/configmap.yaml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/base/configmap.yaml" << YAMLEOF
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: ${SERVICE_NAME}-config
+            namespace: ${K8S_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: ${SERVICE_NAME}
+          data:
+            SPRING_PROFILES_ACTIVE: "prod"
+            SERVER_PORT: "${PORT_NUM}"
+            # Add non-sensitive configuration here.
+            # Sensitive values go in Secrets or an external secrets manager.
+          YAMLEOF
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/base/secret.yaml  (template — values injected by CD / Vault)
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/base/secret.yaml" << YAMLEOF
+          # TEMPLATE ONLY — do NOT commit real secrets to this file.
+          # Use External Secrets Operator, Vault Agent, or sealed-secrets.
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: ${SERVICE_NAME}-secrets
+            namespace: ${K8S_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: ${SERVICE_NAME}
+            annotations:
+              # Example: External Secrets Operator annotation
+              # external-secrets.io/vault-path: "secret/data/${SERVICE_NAME}"
+          type: Opaque
+          stringData:
+            DB_URL: "CHANGEME"
+            DB_USERNAME: "CHANGEME"
+            DB_PASSWORD: "CHANGEME"
+          YAMLEOF
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/base/deployment.yaml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/base/deployment.yaml" << YAMLEOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${SERVICE_NAME}
+            namespace: ${K8S_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: ${SERVICE_NAME}
+              app.kubernetes.io/version: "latest"
+              app.kubernetes.io/component: backend
+              app.kubernetes.io/part-of: ${TEAM}-platform
+              app.kubernetes.io/managed-by: platform-engineering
+            annotations:
+              deployment.kubernetes.io/revision: "1"
+          spec:
+            replicas: ${REPLICAS}
+            revisionHistoryLimit: 5
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: ${SERVICE_NAME}
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0        # Zero-downtime rolling update
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: ${SERVICE_NAME}
+                  app.kubernetes.io/version: "latest"
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/path: "/actuator/prometheus"
+                  prometheus.io/port: "${PORT_NUM}"
+              spec:
+                serviceAccountName: ${SERVICE_NAME}
+                automountServiceAccountToken: false
+                terminationGracePeriodSeconds: 60
+
+                # Security hardening at pod level
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 65532          # distroless nonroot uid
+                  runAsGroup: 65532
+                  fsGroup: 65532
+                  seccompProfile:
+                    type: RuntimeDefault
+
+                containers:
+                  - name: ${SERVICE_NAME}
+                    image: ${IMAGE_NAME}:latest
+                    imagePullPolicy: Always
+                    ports:
+                      - name: http
+                        containerPort: ${PORT_NUM}
+                        protocol: TCP
+
+                    # Container-level security hardening
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities:
+                        drop: [ALL]
+
+                    # Environment from ConfigMap and Secret
+                    envFrom:
+                      - configMapRef:
+                          name: ${SERVICE_NAME}-config
+                      - secretRef:
+                          name: ${SERVICE_NAME}-secrets
+
+                    # Explicit env overrides
+                    env:
+                      - name: POD_NAME
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.name
+                      - name: POD_NAMESPACE
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.namespace
+                      - name: NODE_NAME
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: spec.nodeName
+
+                    # Resource limits — tune per service requirements
+                    resources:
+                      requests:
+                        cpu: "${CPU_REQUEST}"
+                        memory: "${MEM_REQUEST}"
+                      limits:
+                        cpu: "${CPU_LIMIT}"
+                        memory: "${MEM_LIMIT}"
+
+                    # Liveness probe — restart container if it deadlocks
+                    livenessProbe:
+                      httpGet:
+                        path: /actuator/health/liveness
+                        port: http
+                      initialDelaySeconds: 30
+                      periodSeconds: 15
+                      failureThreshold: 3
+                      successThreshold: 1
+                      timeoutSeconds: 5
+
+                    # Readiness probe — remove from LB if not ready
+                    readinessProbe:
+                      httpGet:
+                        path: /actuator/health/readiness
+                        port: http
+                      initialDelaySeconds: 20
+                      periodSeconds: 10
+                      failureThreshold: 3
+                      successThreshold: 1
+                      timeoutSeconds: 5
+
+                    # Startup probe — allow slow starts (e.g., heavy init)
+                    startupProbe:
+                      httpGet:
+                        path: /actuator/health/liveness
+                        port: http
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                      failureThreshold: 30   # 30 * 5s = 150s max startup time
+                      timeoutSeconds: 5
+
+                    # Lifecycle hooks for graceful shutdown
+                    lifecycle:
+                      preStop:
+                        exec:
+                          command: ["/bin/sh", "-c", "sleep 10"]  # drain connections
+
+                    # Writable tmp directories for read-only root filesystem
+                    volumeMounts:
+                      - name: tmp
+                        mountPath: /tmp
+                      - name: logs
+                        mountPath: /app/logs
+
+                volumes:
+                  - name: tmp
+                    emptyDir: {}
+                  - name: logs
+                    emptyDir: {}
+
+                # Spread pods across nodes / zones
+                topologySpreadConstraints:
+                  - maxSkew: 1
+                    topologyKey: kubernetes.io/hostname
+                    whenUnsatisfiable: DoNotSchedule
+                    labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: ${SERVICE_NAME}
+                  - maxSkew: 1
+                    topologyKey: topology.kubernetes.io/zone
+                    whenUnsatisfiable: ScheduleAnyway
+                    labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: ${SERVICE_NAME}
+
+                # Prefer nodes with the team label
+                affinity:
+                  podAntiAffinity:
+                    preferredDuringSchedulingIgnoredDuringExecution:
+                      - weight: 100
+                        podAffinityTerm:
+                          topologyKey: kubernetes.io/hostname
+                          labelSelector:
+                            matchLabels:
+                              app.kubernetes.io/name: ${SERVICE_NAME}
+          YAMLEOF
+          echo "✔ deployment.yaml generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/base/service.yaml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/base/service.yaml" << YAMLEOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${SERVICE_NAME}
+            namespace: ${K8S_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: ${SERVICE_NAME}
+            annotations:
+              prometheus.io/scrape: "true"
+              prometheus.io/port: "${PORT_NUM}"
+          spec:
+            type: ClusterIP
+            selector:
+              app.kubernetes.io/name: ${SERVICE_NAME}
+            ports:
+              - name: http
+                port: 80
+                targetPort: http
+                protocol: TCP
+          YAMLEOF
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/base/ingress.yaml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/base/ingress.yaml" << YAMLEOF
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: ${SERVICE_NAME}
+            namespace: ${K8S_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: ${SERVICE_NAME}
+            annotations:
+              kubernetes.io/ingress.class: "nginx"
+              nginx.ingress.kubernetes.io/rewrite-target: /
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+              # Rate limiting
+              nginx.ingress.kubernetes.io/limit-rps: "100"
+              nginx.ingress.kubernetes.io/limit-connections: "20"
+              # Timeouts
+              nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+              nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+              nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+              # CORS (configure as needed)
+              # nginx.ingress.kubernetes.io/enable-cors: "true"
+              # nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+          spec:
+            tls:
+              - hosts:
+                  - ${SERVICE_NAME}.example.com
+                secretName: ${SERVICE_NAME}-tls
+            rules:
+              - host: ${SERVICE_NAME}.example.com
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: ${SERVICE_NAME}
+                          port:
+                            name: http
+          YAMLEOF
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/base/hpa.yaml  (Horizontal Pod Autoscaler)
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/base/hpa.yaml" << YAMLEOF
+          apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata:
+            name: ${SERVICE_NAME}
+            namespace: ${K8S_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: ${SERVICE_NAME}
+          spec:
+            scaleTargetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: ${SERVICE_NAME}
+            minReplicas: ${REPLICAS}
+            maxReplicas: 10
+            metrics:
+              - type: Resource
+                resource:
+                  name: cpu
+                  target:
+                    type: Utilization
+                    averageUtilization: 70
+              - type: Resource
+                resource:
+                  name: memory
+                  target:
+                    type: Utilization
+                    averageUtilization: 80
+            behavior:
+              scaleUp:
+                stabilizationWindowSeconds: 60
+                policies:
+                  - type: Pods
+                    value: 2
+                    periodSeconds: 60
+              scaleDown:
+                stabilizationWindowSeconds: 300   # 5-minute cool-down before scale-down
+                policies:
+                  - type: Pods
+                    value: 1
+                    periodSeconds: 120
+          YAMLEOF
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/base/pdb.yaml  (Pod Disruption Budget)
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/base/pdb.yaml" << YAMLEOF
+          apiVersion: policy/v1
+          kind: PodDisruptionBudget
+          metadata:
+            name: ${SERVICE_NAME}
+            namespace: ${K8S_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: ${SERVICE_NAME}
+          spec:
+            minAvailable: 1          # Always keep at least 1 pod during voluntary disruptions
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: ${SERVICE_NAME}
+          YAMLEOF
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/base/networkpolicy.yaml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/base/networkpolicy.yaml" << YAMLEOF
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: ${SERVICE_NAME}
+            namespace: ${K8S_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: ${SERVICE_NAME}
+          spec:
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: ${SERVICE_NAME}
+            policyTypes:
+              - Ingress
+              - Egress
+
+            ingress:
+              # Allow traffic from the ingress controller
+              - from:
+                  - namespaceSelector:
+                      matchLabels:
+                        kubernetes.io/metadata.name: ingress-nginx
+                ports:
+                  - port: ${PORT_NUM}
+                    protocol: TCP
+              # Allow prometheus scraping
+              - from:
+                  - namespaceSelector:
+                      matchLabels:
+                        kubernetes.io/metadata.name: monitoring
+                ports:
+                  - port: ${PORT_NUM}
+                    protocol: TCP
+
+            egress:
+              # Allow DNS resolution
+              - ports:
+                  - port: 53
+                    protocol: UDP
+                  - port: 53
+                    protocol: TCP
+              # Allow HTTPS to external services
+              - ports:
+                  - port: 443
+                    protocol: TCP
+              # Allow database access (update port as needed)
+              - ports:
+                  - port: 5432    # PostgreSQL
+                    protocol: TCP
+                  - port: 3306    # MySQL
+                    protocol: TCP
+          YAMLEOF
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/base/kustomization.yaml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/base/kustomization.yaml" << YAMLEOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+
+          commonLabels:
+            app.kubernetes.io/name: ${SERVICE_NAME}
+            app.kubernetes.io/part-of: ${TEAM}-platform
+
+          resources:
+            - namespace.yaml
+            - serviceaccount.yaml
+            - configmap.yaml
+            - secret.yaml
+            - deployment.yaml
+            - service.yaml
+            - ingress.yaml
+            - hpa.yaml
+            - pdb.yaml
+            - networkpolicy.yaml
+          YAMLEOF
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/overlays/dev/kustomization.yaml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/overlays/dev/kustomization.yaml" << YAMLEOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+
+          namespace: ${K8S_NAMESPACE}-dev
+
+          resources:
+            - ../../base
+
+          patches:
+            - target:
+                kind: Deployment
+                name: ${SERVICE_NAME}
+              patch: |-
+                - op: replace
+                  path: /spec/replicas
+                  value: 1
+                - op: replace
+                  path: /spec/template/spec/containers/0/resources/requests/cpu
+                  value: "100m"
+                - op: replace
+                  path: /spec/template/spec/containers/0/resources/requests/memory
+                  value: "128Mi"
+            - target:
+                kind: HorizontalPodAutoscaler
+                name: ${SERVICE_NAME}
+              patch: |-
+                - op: replace
+                  path: /spec/minReplicas
+                  value: 1
+                - op: replace
+                  path: /spec/maxReplicas
+                  value: 2
+
+          configMapGenerator:
+            - name: ${SERVICE_NAME}-config
+              behavior: merge
+              literals:
+                - SPRING_PROFILES_ACTIVE=dev
+          YAMLEOF
+
+          # ─────────────────────────────────────────────────────────────────────
+          # k8s/overlays/prod/kustomization.yaml
+          # ─────────────────────────────────────────────────────────────────────
+          cat > "${K8S}/overlays/prod/kustomization.yaml" << YAMLEOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+
+          namespace: ${K8S_NAMESPACE}
+
+          resources:
+            - ../../base
+
+          images:
+            - name: ${IMAGE_NAME}
+              newTag: "\${IMAGE_TAG}"    # Injected by CD pipeline at deploy time
+
+          configMapGenerator:
+            - name: ${SERVICE_NAME}-config
+              behavior: merge
+              literals:
+                - SPRING_PROFILES_ACTIVE=prod
+          YAMLEOF
+
+          echo "✔ All Kubernetes manifests generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # GitHub Actions CI/CD Workflow for the generated service
+          # ─────────────────────────────────────────────────────────────────────
+          cat > ".github/workflows/ci.yml" << YAMLEOF
+          name: CI / CD Pipeline
+
+          on:
+            push:
+              branches: [develop, master, "release/**", "hotfix/**", "patch/**"]
+            pull_request:
+              branches: [develop, master, "release/**"]
+
+          env:
+            IMAGE_NAME: ${IMAGE_NAME}
+            JAVA_VERSION: "${JAVA_VERSION}"
+
+          jobs:
+            # ── Build & Test ──────────────────────────────────────────────────
+            build:
+              name: Build & Test
+              runs-on: ubuntu-latest
+              timeout-minutes: 15
+
+              steps:
+                - uses: actions/checkout@v4
+
+                - name: Set up JDK \${{ env.JAVA_VERSION }}
+                  uses: actions/setup-java@v4
+                  with:
+                    java-version: \${{ env.JAVA_VERSION }}
+                    distribution: temurin
+                    cache: maven
+
+                - name: Build & unit tests
+                  run: mvn -B verify
+
+                - name: Upload test results
+                  uses: actions/upload-artifact@v4
+                  if: always()
+                  with:
+                    name: test-results
+                    path: target/surefire-reports/
+
+                - name: Upload JaCoCo coverage report
+                  uses: actions/upload-artifact@v4
+                  with:
+                    name: coverage-report
+                    path: target/site/jacoco/
+
+                - name: SonarQube scan
+                  if: github.event_name == 'pull_request' || github.ref == 'refs/heads/develop'
+                  env:
+                    SONAR_TOKEN: \${{ secrets.SONAR_TOKEN }}
+                    SONAR_HOST_URL: \${{ secrets.SONAR_HOST_URL }}
+                  run: |
+                    mvn -B sonar:sonar \
+                      -Dsonar.projectKey=${SERVICE_NAME} \
+                      -Dsonar.host.url=\${{ secrets.SONAR_HOST_URL }} \
+                      -Dsonar.login=\${{ secrets.SONAR_TOKEN }}
+
+                - name: Snyk security scan
+                  uses: snyk/actions/maven@master
+                  env:
+                    SNYK_TOKEN: \${{ secrets.SNYK_TOKEN }}
+                  with:
+                    args: --severity-threshold=high
+
+            # ── Build & Push Docker Image ─────────────────────────────────────
+            docker:
+              name: Build & Push Image
+              runs-on: ubuntu-latest
+              needs: build
+              timeout-minutes: 15
+              if: |
+                github.event_name == 'push' &&
+                (github.ref == 'refs/heads/master' ||
+                 startsWith(github.ref, 'refs/heads/release/'))
+
+              permissions:
+                contents: read
+                packages: write
+
+              steps:
+                - uses: actions/checkout@v4
+
+                - name: Set up QEMU
+                  uses: docker/setup-qemu-action@v3
+
+                - name: Set up Docker Buildx
+                  uses: docker/setup-buildx-action@v3
+
+                - name: Log in to GHCR
+                  uses: docker/login-action@v3
+                  with:
+                    registry: ghcr.io
+                    username: \${{ github.actor }}
+                    password: \${{ secrets.GITHUB_TOKEN }}
+
+                - name: Extract Docker metadata
+                  id: meta
+                  uses: docker/metadata-action@v5
+                  with:
+                    images: \${{ env.IMAGE_NAME }}
+                    tags: |
+                      type=sha,prefix=sha-
+                      type=ref,event=branch
+                      type=semver,pattern={{version}}
+
+                - name: Build and push
+                  uses: docker/build-push-action@v6
+                  with:
+                    context: .
+                    push: true
+                    platforms: linux/amd64,linux/arm64
+                    tags: \${{ steps.meta.outputs.tags }}
+                    labels: \${{ steps.meta.outputs.labels }}
+                    cache-from: type=gha
+                    cache-to: type=gha,mode=max
+
+                - name: Scan image with Trivy
+                  uses: aquasecurity/trivy-action@master
+                  with:
+                    image-ref: \${{ env.IMAGE_NAME }}:sha-\${{ github.sha }}
+                    format: sarif
+                    output: trivy-results.sarif
+                    exit-code: 1
+                    severity: CRITICAL,HIGH
+
+                - name: Upload Trivy SARIF
+                  uses: github/codeql-action/upload-sarif@v3
+                  if: always()
+                  with:
+                    sarif_file: trivy-results.sarif
+
+            # ── Deploy to Dev ─────────────────────────────────────────────────
+            deploy-dev:
+              name: Deploy → Dev
+              runs-on: ubuntu-latest
+              needs: docker
+              environment: dev
+              timeout-minutes: 10
+              if: github.ref == 'refs/heads/develop'
+
+              steps:
+                - uses: actions/checkout@v4
+                - name: Deploy to dev cluster
+                  run: |
+                    cd k8s
+                    kustomize edit set image ${IMAGE_NAME}=\${{ env.IMAGE_NAME }}:sha-\${{ github.sha }}
+                    kubectl apply -k overlays/dev --context=\${{ secrets.KUBE_CONTEXT_DEV }}
+
+            # ── Deploy to Prod ────────────────────────────────────────────────
+            deploy-prod:
+              name: Deploy → Prod
+              runs-on: ubuntu-latest
+              needs: docker
+              environment: production
+              timeout-minutes: 10
+              if: github.ref == 'refs/heads/master'
+
+              steps:
+                - uses: actions/checkout@v4
+                - name: Deploy to production cluster
+                  env:
+                    IMAGE_TAG: sha-\${{ github.sha }}
+                  run: |
+                    kubectl apply -k k8s/overlays/prod \
+                      --context=\${{ secrets.KUBE_CONTEXT_PROD }}
+          YAMLEOF
+          echo "✔ .github/workflows/ci.yml generated"
+
+          # ─────────────────────────────────────────────────────────────────────
+          # README.md
+          # ─────────────────────────────────────────────────────────────────────
+          cat > README.md << MDEOF
+          # ${SERVICE_NAME}
+
+          > ${DESCRIPTION}
+
+          **Owner:** ${TEAM} | **Java:** ${JAVA_VERSION} | **Spring Boot:** ${SB_VERSION}
+
+          ---
+
+          ## Getting Started
+
+          ### Prerequisites
+          - Java ${JAVA_VERSION}+
+          - Maven 3.9+
+          - Docker 24+
+          - kubectl + kustomize (for Kubernetes deployment)
+
+          ### Run Locally
+          \`\`\`bash
+          mvn spring-boot:run -Dspring-boot.run.profiles=dev
+          \`\`\`
+
+          ### Run Tests
+          \`\`\`bash
+          mvn verify        # unit tests + coverage report
+          mvn failsafe:integration-test   # integration tests
+          \`\`\`
+
+          ### Build Docker Image
+          \`\`\`bash
+          docker build -t ${IMAGE_NAME}:local .
+          \`\`\`
+
+          ## API Documentation
+          | URL | Description |
+          |-----|-------------|
+          | \`/swagger-ui.html\` | Swagger UI (dev/staging only) |
+          | \`/v3/api-docs\` | OpenAPI JSON spec |
+          | \`/actuator/health\` | Spring Boot health endpoint |
+          | \`/actuator/prometheus\` | Prometheus metrics scrape endpoint |
+
+          ## Kubernetes Deployment
+
+          ### Deploy to Dev
+          \`\`\`bash
+          kubectl apply -k k8s/overlays/dev
+          \`\`\`
+
+          ### Deploy to Production
+          \`\`\`bash
+          export IMAGE_TAG=<sha>
+          kubectl apply -k k8s/overlays/prod
+          \`\`\`
+
+          ## Project Structure
+          \`\`\`
+          ├── src/
+          │   ├── main/java/${JAVA_PACKAGE//.//}/
+          │   │   ├── ${MAIN_CLASS}.java        # Entry point
+          │   │   ├── controller/               # REST controllers
+          │   │   ├── service/                  # Business logic
+          │   │   ├── model/                    # Domain models / DTOs
+          │   │   ├── config/                   # Spring configuration
+          │   │   └── exception/               # Global exception handling
+          │   └── main/resources/
+          │       ├── application.yml           # Base config
+          │       └── application-prod.yml      # Production overrides
+          ├── k8s/
+          │   ├── base/                         # K8s base manifests
+          │   └── overlays/dev|staging|prod/    # Kustomize overlays
+          ├── .github/workflows/ci.yml          # CI/CD pipeline
+          └── Dockerfile                        # Multi-stage build
+          \`\`\`
+
+          ## Branching Strategy
+          | Branch | Purpose |
+          |--------|---------|
+          | \`feature/JIRA-XXX-*\` | New features (from develop) |
+          | \`release/x.y.z\` | Release stabilization |
+          | \`patch/JIRA-XXX-*\` | Bug fixes during release testing |
+          | \`hotfix/INC-XXX-*\` | Critical production fixes (from master) |
+
+          ---
+          *Scaffolded by Platform Engineering · Port Self-Service Action*
+          MDEOF
+          echo "✔ README.md generated"
+
+          echo ""
+          echo "════════════════════════════════════════════════"
+          echo "  All files generated successfully"
+          echo "════════════════════════════════════════════════"
+          ls -la
+
+      # ── 5. Commit & Push ────────────────────────────────────────────────────
+      - name: Commit and push scaffold
+        working-directory: generated-service
+        run: |
+          git config user.name  "Platform Engineering Bot"
+          git config user.email "platform-bot@${GITHUB_ORG}.com"
+
+          git add .
+          git commit -m "chore: scaffold Java Spring Boot service
+
+          Service: ${SERVICE_NAME}
+          Java: ${JAVA_VERSION} | Spring Boot: ${SB_VERSION}
+          K8s namespace: ${K8S_NAMESPACE}
+          Team: ${TEAM}
+
+          Generated by Platform Engineering scaffold action.
+          Jira/Port run: ${PORT_RUN_ID}"
+
+          git push origin main
+          echo "✔ Code pushed to https://github.com/${GITHUB_ORG}/${REPO_NAME}"
+
+      # ── 6. Register service entity in Port ──────────────────────────────────
+      - name: Register entity in Port catalog
+        run: |
+          curl -s -X POST "${PORT_API}/blueprints/service/entities?upsert=true&merge=true" \
+            -H "Authorization: Bearer ${PORT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"identifier\": \"${SERVICE_NAME}\",
+              \"title\": \"${SERVICE_NAME}\",
+              \"properties\": {
+                \"description\": \"${DESCRIPTION}\",
+                \"language\": \"Java\",
+                \"framework\": \"Spring Boot ${SB_VERSION}\",
+                \"repoUrl\": \"https://github.com/${GITHUB_ORG}/${REPO_NAME}\",
+                \"k8sNamespace\": \"${K8S_NAMESPACE}\"
+              },
+              \"relations\": {}
+            }"
+          echo "✔ Service entity registered in Port"
+
+      # ── 7. Mark Port action run as SUCCESS ──────────────────────────────────
+      - name: Report success to Port
+        if: success()
+        run: |
+          curl -s -X PATCH "${PORT_API}/actions/runs/${PORT_RUN_ID}" \
+            -H "Authorization: Bearer ${PORT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"status\": \"SUCCESS\",
+              \"summary\": \"Service scaffolded successfully!\",
+              \"link\": \"https://github.com/${GITHUB_ORG}/${REPO_NAME}\"
+            }"
+
+      # ── 8. Mark Port action run as FAILURE (on error) ───────────────────────
+      - name: Report failure to Port
+        if: failure()
+        run: |
+          curl -s -X PATCH "${PORT_API}/actions/runs/${PORT_RUN_ID}" \
+            -H "Authorization: Bearer ${PORT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"status\": \"FAILURE\",
+              \"summary\": \"Scaffold failed — check the GitHub Actions run for details.\",
+              \"link\": \"https://github.com/${GITHUB_ORG}/port-actions/actions/runs/${GITHUB_RUN_ID}\"
+            }"
